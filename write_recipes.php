@@ -17,7 +17,6 @@ use GuzzleHttp\Exception\RequestException;
 use GuzzleHttp\Exception\ClientException;
 
 
-
 // these should be constant
 // generating them purely for documentation
 $repoUuid = Uuid::uuid5(Uuid::NAMESPACE_DNS, 'repository.ou.edu');
@@ -25,9 +24,8 @@ $repoSha =sha1($repoUuid);
 assert(strcmp("eb0ecf41-a457-5220-893a-08b7604b7110",$repoUuid)==0);
 assert(strcmp("1639fb25f09f85a3b035bd7a0a62b2a9c7e00c18",$repoSha)==0);
 
-
-
-    
+// Adds basic top level info to a josn representation of a book 
+//
 function makeRecipeJson(  $bagName, $itemLabel)
 {
 
@@ -40,6 +38,7 @@ function makeRecipeJson(  $bagName, $itemLabel)
 	$json['recipe'] = Array();
 	$json['recipe']['import'] = 'book';
 	$json['recipe']['update'] = 'false';
+	// This is the book uuid and will be used in the book uri
 	$json['recipe']['uuid'] = Uuid::uuid5($repoUuid, $bagName)->toString();
 	$json['recipe']['label'] = $itemLabel;
 	  
@@ -62,7 +61,6 @@ function pagecmp($a,$b){
 }
 
 
-
 // given a json item record and a sting representation of a manifest
 // iterates through the manifest and adds page records 
 function addPagesFromString($json, $manifest, $bagName) {
@@ -74,16 +72,22 @@ function addPagesFromString($json, $manifest, $bagName) {
     $index=0;
     foreach($lines as $fileInfo) {
 
-	   if($fileInfo != "" && (strpos($fileInfo, ".tif") > 0 || strpos($fileInfo, ".tiff") > 0 || strpos($fileInfo, ".TIF") > 0) ){ 
+	if($fileInfo != "" && (strpos($fileInfo, ".tif") > 0 || strpos($fileInfo, ".tiff") > 0 || strpos($fileInfo, ".TIF") > 0) ){ 
 	    $fileInfoArr = explode(" ", $fileInfo);
 	    $length = count($fileInfoArr);
-	    $fileName = trim(explode("/", trim($fileInfoArr[$length-1]))[1]);
-	    
+
+	    // don't add filenames that aren't at the top level
+	    $fileEntry = trim($fileInfoArr[$length-1]);
+	    $fileName = basename($fileEntry);
+	    if (0 != strcmp( $fileEntry, "data/".$fileName)) {
+		continue;
+	    }
+	    $fileHash = trim($fileInfoArr[0]);
+
 	    $json['recipe']['pages'][$index]['label'] = substr($fileName, 0, -4);
 	    $json['recipe']['pages'][$index]['file'] = $fileName;
 	    // currently lying about what hashes we're using
-	    // $json['recipe']['pages'][$index]['md5'] = trim($fileInfoArr[0]);
-	    $json['recipe']['pages'][$index]['md5'] = trim($fileInfoArr[0]);
+	    $json['recipe']['pages'][$index]['md5'] = $fileHash;
 	    $json['recipe']['pages'][$index]['uuid'] = Uuid::uuid5($repoUuid, $bagName."/data/".$fileName)->toString();
 	    $json['recipe']['pages'][$index]['exif'] = $fileName.".exif.txt";
 	    
@@ -92,10 +96,17 @@ function addPagesFromString($json, $manifest, $bagName) {
 	}
     }
 
+
+    // files in manifest aren't sorted, so we need to sort them.
     $temp_json=array_values($json['recipe']['pages']);
     usort($temp_json, "pagecmp");
-    $json['recipe']['pages'] = $temp_json; 
+    
+    // update labels to reflect image sequence order. 
+    for($pcnt=0;$pcnt < count($temp_json); $pcnt++ ) {
+	$temp_json[$pcnt]['label']="Image " .($pcnt+1) ;
+    }
 
+    $json['recipe']['pages'] = $temp_json; 
     return json_encode($json, JSON_PRETTY_PRINT);
 }
 
@@ -109,6 +120,11 @@ if(! $outpath =@ $argv[2] ) {
     exit("No output path specified.\n");
 }
 
+
+if(! $bagSrc =@ $argv[3] ) {
+    exit("No source folder for bags specified.\n");
+}
+
 if(! $csvfh = @fopen( $itemfile, "r" ) ) {
     exit("Couldn't open file: $php_errormsg\n");
 }
@@ -118,11 +134,22 @@ if(! is_dir($outpath)) {
 }
 
 
+if(! is_dir($bagSrc)) {
+    exit("bag src folder isn't a directory\n");
+}
 
-// Set up Guzzle client to make requests for marcxml 
-$bagClient = new Client(['base_uri' => 'https://bagit.lib.ou.edu/UL-BAGIT/',
-		      'auth' => $FA_account]);
+// If we're using remote bags, set up Guzzle client to make requests for bag manifest
+$bagClient= NULL;
+if (substr( $bagSrc, 0, 8 ) === "https://") {
+    $bagClient = new Client(['base_uri' => $bagSrc,
+			     'auth' => $FA_account]);
+}
 
+
+
+
+
+// Likewise for marcxml
 $marcClient = new Client(['base_uri' => 'http://52.0.88.11']); 
 
 
@@ -136,10 +163,13 @@ while($line = fgetcsv($csvfh ) ){
     }
 
 
+    $mssid="";
+    $label="";
+    $bagName="";
     
     $csv_err="";
-    if(""!=$line[0]) {
-	$label = $line[0];// human readable name
+    if(""!=$line[9]) {
+	$label = $line[9];// human readable name
     }  else {
 	$csv_err .= ", missing label";
     }
@@ -150,8 +180,8 @@ while($line = fgetcsv($csvfh ) ){
     else {
 	$csv_err .= ", missing mssid ";
     }
-    if(""!=$line[2]) {
-	$bagName = $line[2]; // bagName from digilab
+    if(""!=$line[3]) {
+	$bagName = $line[3]; // bagName from digilab
     } 
     else {
 	$csv_err .=  ", missing bag name" ;
@@ -165,28 +195,30 @@ while($line = fgetcsv($csvfh ) ){
 
 
     try {
-	$response = $bagClient->get("./$bagName/manifest-md5.txt");
 
-	$manifest = $response->getBody();
-	$manifestString = $manifest->getContents();
+    
+        print "Processing $bagName\n";
 
-	$json =makeRecipeJson( $bagName, $label);
+	// Get the list of files to include from the bag manifest.  If
+	// we're set up to work with remote bags, do that, otherwise
+	// open local files.
+
+	$manifestString="";
+	if (! NULL === $bagClient) {
+	    $response = $bagClient->get("./$bagName/manifest-md5.txt");
+	    $manifest = $response->getBody();
+	    $manifestString = $manifest->getContents();
+	} else {
+	    $manifestString = file_get_contents( "$bagSrc/$bagName/manifest-md5.txt");
+	}
+	
+
+	$json = makeRecipeJson( $bagName, $label);
 	$json = addPagesFromString($json, $manifestString, $bagName);
 	$file = fopen( $outpath."/".$bagName . ".json", "w");
 
 	fwrite( $file, $json);
 	fclose( $file );
-
-    } catch (ClientException $e) {
-	$badcode = $e->getResponse()->getStatusCode();
-	$baduri = $e->getRequest()->getUri();
-
-        print "ERROR getting MANIFEST for $bagName. ";
-	print "Status: $badcode ";
-	print "URI: $baduri \n";
-    }
-
-    try {
 
 	$response = $marcClient->get(".", ['query' => ['bib_id' => $mssid]]);
 
@@ -201,9 +233,17 @@ while($line = fgetcsv($csvfh ) ){
 	$badcode = $e->getResponse()->getStatusCode();
 	$baduri = $e->getRequest()->getUri();
 
-        print "ERROR getting MARC for $bagName.";
+        print "ERROR getting data for $bagName \n";
 	print "Status: $badcode ";
 	print "URI: $baduri \n";
+
+
+    } catch (RequestException $e) {
+
+        print "ERROR with network connection for $bagName \n";
+	print $e->getRequest()->getUri();
+	print "\n";
+  
     }
 
     
